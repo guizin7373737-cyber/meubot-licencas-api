@@ -7,6 +7,7 @@ import hashlib
 import random
 import string
 import logging
+from db_backup import init_backup, get_backup
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -140,6 +141,11 @@ def registrar():
         
         if verificar and verificar[0] == 1:
             logger.info(f"✅ Licença registrada com sucesso: {license_key} | User: {username}")
+            # Sincroniza backup após registro bem-sucedido
+            backup = get_backup()
+            if backup:
+                backup.sync_backup()
+                logger.info("💾 Backup sincronizado com sucesso")
             return jsonify({
                 'mensagem': 'Licença ativada com sucesso!',
                 'license_key': license_key,
@@ -261,6 +267,12 @@ def gerar_route():
                 c.execute('INSERT INTO usuarios (license_key) VALUES (?)', (license_key,))
                 conn.commit()
                 conn.close()
+                
+                # Sincroniza backup após gerar licença
+                backup = get_backup()
+                if backup:
+                    backup.sync_backup()
+                
                 logger.info(f"New license generated: {license_key}")
                 return jsonify({'license_key': license_key}), 201
 
@@ -273,6 +285,11 @@ def gerar_route():
 def listar_route():
     """Lista licenças com filtro (Bot only)"""
     try:
+        # Verifica integridade do BD antes de listar
+        backup = get_backup()
+        if backup:
+            backup.verify_db_integrity()
+        
         filtro = request.args.get('filtro', 'todas').lower()
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
@@ -422,4 +439,7 @@ def remover(license_key):
 
 if __name__ == '__main__':
     init_db()
+    logger.info("🔄 Inicializando sistema de backup...")
+    init_backup(DB_FILE)
+    logger.info("✅ Sistema de backup ativo!")
     app.run(host='0.0.0.0', port=PORT, debug=(ENV == 'development'))
