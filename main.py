@@ -87,7 +87,12 @@ def fazer_requisicao(metodo, endpoint, dados=None, params=None, tentativa=0):
             return (False, None, f"Método desconhecido: {metodo}")
         
         if resp.status_code in [200, 201]:
-            return (True, resp.json(), None)
+            try:
+                return (True, resp.json(), None)
+            except Exception as json_err:
+                logger.error(f"❌ Erro ao parsear JSON: {json_err}")
+                logger.error(f"Resposta recebida: {repr(resp.text)}")
+                return (False, None, f"❌ Resposta inválida do servidor")
         else:
             erro = resp.json().get('erro', 'Erro desconhecido') if resp.text else 'Erro desconhecido'
             return (False, None, erro)
