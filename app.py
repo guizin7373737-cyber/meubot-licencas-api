@@ -14,8 +14,20 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 API_SECRET = os.environ.get('API_SECRET', 'seu_token_secreto_aqui')
-# Banco de dados centralizado na raiz (Zphantom2/)
-DB_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'licencas.db')
+
+# Banco de dados - usar sempre a pasta local (Meubot/)
+# Em Render, use /tmp/ que é temporário, mas salvamos periodicamente
+if os.environ.get('FLASK_ENV') == 'production':
+    # Em Render: usar /tmp/ como fallback
+    DB_FILE = os.environ.get('DB_PATH', '/tmp/licencas.db')
+    logger.info(f"🔒 Modo PRODUCTION: BD em {DB_FILE}")
+else:
+    # Localmente: usa a pasta Zphantom2
+    DB_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'licencas.db')
+    logger.info(f"🔓 Modo DESENVOLVIMENTO: BD em {DB_FILE}")
+
+logger.info(f"📁 Banco de dados: {DB_FILE}")
+
 ENV = os.environ.get('FLASK_ENV', 'production')
 PORT = int(os.environ.get('PORT', 8080))
 
@@ -74,6 +86,7 @@ def status():
     }), 200
 
 @app.route('/registrar', methods=['POST'])
+@verificar_token
 def registrar():
     """Registra uma nova licença com username e password"""
     try:
@@ -83,6 +96,8 @@ def registrar():
         password = dados.get('password', '').strip()
         hwid = dados.get('hwid', '').strip()
         ip_cliente = request.remote_addr
+        
+        logger.info(f"📝 Registrando: {license_key} | User: {username}")
         
         if not all([license_key, username, password, hwid]):
             return jsonify({'erro': 'Dados incompletos'}), 400
@@ -99,30 +114,46 @@ def registrar():
         
         if not usuario:
             conn.close()
+            logger.warning(f"❌ Licença não encontrada: {license_key}")
             return jsonify({'erro': 'Licença inválida'}), 400
         
-        if usuario[5] == 1:
+        # usuario[8] = registered
+        if usuario[8] == 1:
             conn.close()
+            logger.warning(f"⚠️ Licença já registrada: {license_key}")
             return jsonify({'erro': 'Licença já foi ativada'}), 400
         
         # Atualiza o registro
         c.execute('''
             UPDATE usuarios 
-            SET username = ?, password_hash = ?, hwid = ?, ip_registro = ?, registered = 1
+            SET username = ?, password_hash = ?, hwid = ?, ip_registro = ?, registered = 1, ativo = 1
             WHERE license_key = ?
         ''', (username, password_hash, hwid, ip_cliente, license_key))
         
         conn.commit()
+        
+        # Verifica se o UPDATE funcionou
+        c.execute('SELECT registered FROM usuarios WHERE license_key = ?', (license_key,))
+        verificar = c.fetchone()
+        
         conn.close()
         
-        logger.info(f"License registered: {license_key}")
-        return jsonify({
-            'mensagem': 'Licença ativada com sucesso!',
-            'license_key': license_key
-        }), 201
+        if verificar and verificar[0] == 1:
+            logger.info(f"✅ Licença registrada com sucesso: {license_key} | User: {username}")
+            return jsonify({
+                'mensagem': 'Licença ativada com sucesso!',
+                'license_key': license_key,
+                'username': username
+            }), 201
+        else:
+            logger.error(f"❌ Falha ao registrar: {license_key}")
+            return jsonify({'erro': 'Erro ao registrar licença'}), 500
     
+    except sqlite3.IntegrityError as e:
+        logger.error(f"❌ Erro de integridade BD: {e}")
+        return jsonify({'erro': 'Licença ou username duplicado'}), 400
     except Exception as e:
-        logger.error(f"Error in /registrar: {str(e)}")
+        logger.error(f"❌ Erro em /registrar: {str(e)}")
         return jsonify({'erro': f'Erro no servidor: {str(e)}'}), 500
 
 @app.route('/validar', methods=['POST'])
@@ -167,7 +198,10 @@ def login():
         username = dados.get('username', '').strip()
         password = dados.get('password', '').strip()
         
+        logger.info(f"🔐 Tentativa de login: {username}")
+        
         if not username or not password:
+            logger.warning(f"❌ Login vazio: user={username}")
             return jsonify({'erro': 'Username ou password vazios'}), 400
         
         password_hash = hashlib.sha256(password.encode()).hexdigest()
@@ -175,25 +209,41 @@ def login():
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
         
-        c.execute('''
-            SELECT * FROM usuarios 
-            WHERE username = ? AND password_hash = ? AND ativo = 1 AND registered = 1
-        ''', (username, password_hash))
-        
+        # Primeiro verifica se o usuário existe
+        c.execute('SELECT * FROM usuarios WHERE username = ?', (username,))
         usuario = c.fetchone()
+        
+        if not usuario:
+            conn.close()
+            logger.warning(f"❌ Usuário não encontrado: {username}")
+            return jsonify({'erro': 'Credenciais inválidas'}), 401
+        
+        logger.info(f"✓ Usuário encontrado: {username} | Registered: {usuario[8]} | Ativo: {usuario[7]}")
+        
+        # Verifica password
+        if usuario[3] != password_hash:
+            conn.close()
+            logger.warning(f"❌ Senha incorreta para: {username}")
+            return jsonify({'erro': 'Credenciais inválidas'}), 401
+        
+        # Verifica se está ativo e registrado
+        if usuario[7] == 0 or usuario[8] == 0:
+            conn.close()
+            logger.warning(f"❌ Licença inativa/não registrada: {username} | Ativo: {usuario[7]} | Registrada: {usuario[8]}")
+            return jsonify({'erro': 'Licença banida ou não registrada'}), 401
+        
         conn.close()
         
-        if usuario:
-            return jsonify({
-                'mensagem': 'Login bem-sucedido',
-                'license_key': usuario[1],
-                'status': 'ativo'
-            }), 200
-        else:
-            return jsonify({'erro': 'Credenciais inválidas'}), 401
+        logger.info(f"✅ Login bem-sucedido: {username}")
+        return jsonify({
+            'mensagem': 'Login bem-sucedido',
+            'license_key': usuario[1],
+            'username': username,
+            'status': 'ativo'
+        }), 200
     
     except Exception as e:
-        logger.error(f"Error in /login: {str(e)}")
+        logger.error(f"❌ Erro em /login: {str(e)}")
         return jsonify({'erro': f'Erro no servidor: {str(e)}'}), 500
 
 @app.route('/gerar', methods=['POST'])
