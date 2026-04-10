@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+.env.local
+licencas.db
+*.db
+.vscode/
+.idea/
