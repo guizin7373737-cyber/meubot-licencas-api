@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Ambiente Virtual
+venv/
+env/
+ENV/
+
+# Variáveis de Ambiente
+.env
+.env.local
+.env.*.local
+
+# Banco de Dados
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Arquivos temporários
+*.tmp
+*.bak
+
+# Dist e Build
+dist/
+build/
+*.spec
