@@ -354,9 +354,13 @@ if __name__ == '__main__':
     db = get_db()
     logger.info("✅ Database Manager ativo!")
     
-    logger.info("🔄 Inicializando sistema de backup...")
-    init_backup(None)  # db_manager não precisa de DB_FILE
-    logger.info("✅ Sistema de backup ativo!")
+    # Sistema de backup é opcional quando usando PostgreSQL
+    try:
+        logger.info("🔄 Inicializando sistema de backup...")
+        init_backup(None)
+        logger.info("✅ Sistema de backup ativo!")
+    except Exception as e:
+        logger.warning(f"⚠️ Sistema de backup com problemas: {e}")
     
     logger.info(f"🌍 Servidor rodando em porta {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=(ENV == 'development'))

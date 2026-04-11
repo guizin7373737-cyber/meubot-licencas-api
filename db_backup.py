@@ -13,9 +13,13 @@ import logging
 logger = logging.getLogger(__name__)
 
 class DBBackup:
-    def __init__(self, db_file):
+    def __init__(self, db_file=None):
+        # Se db_file for None, usa caminho padrão
+        if db_file is None:
+            db_file = os.path.join(os.path.dirname(__file__), 'licencas.db')
+        
         self.db_file = db_file
-        self.backup_file = db_file.replace('.db', '_backup.json')
+        self.backup_file = db_file.replace('.db', '_backup.json') if db_file else 'licencas_backup.json'
         self.memory_cache = {}
         self.load_backup()
     
@@ -34,32 +38,37 @@ class DBBackup:
     def save_backup(self):
         """Salva backup em JSON para Render/Discloud"""
         try:
-            conn = sqlite3.connect(self.db_file)
-            conn.row_factory = sqlite3.Row
-            c = conn.cursor()
+            # Se não tem cache em memória, tira do SQLite (se existir)
+            if not self.memory_cache and os.path.exists(self.db_file):
+                try:
+                    conn = sqlite3.connect(self.db_file)
+                    conn.row_factory = sqlite3.Row
+                    c = conn.cursor()
+                    c.execute('SELECT * FROM usuarios')
+                    usuarios = c.fetchall()
+                    
+                    backup_data = {}
+                    for user in usuarios:
+                        backup_data[user['license_key']] = {
+                            'license_key': user['license_key'],
+                            'username': user['username'],
+                            'password_hash': user['password_hash'],
+                            'hwid': user['hwid'],
+                            'ip_registro': user['ip_registro'],
+                            'data_registro': user['data_registro'],
+                            'ativo': user['ativo'],
+                            'registered': user['registered']
+                        }
+                    conn.close()
+                    self.memory_cache = backup_data
+                except:
+                    pass
             
-            c.execute('SELECT * FROM usuarios')
-            usuarios = c.fetchall()
-            
-            backup_data = {}
-            for user in usuarios:
-                backup_data[user['license_key']] = {
-                    'license_key': user['license_key'],
-                    'username': user['username'],
-                    'password_hash': user['password_hash'],
-                    'hwid': user['hwid'],
-                    'ip_registro': user['ip_registro'],
-                    'data_registro': user['data_registro'],
-                    'ativo': user['ativo'],
-                    'registered': user['registered']
-                }
-            
-            with open(self.backup_file, 'w') as f:
-                json.dump(backup_data, f, indent=2)
-            
-            self.memory_cache = backup_data
-            logger.info(f"💾 Backup salvo: {len(backup_data)} licenças")
-            conn.close()
+            # Salva cache em JSON
+            if self.memory_cache:
+                with open(self.backup_file, 'w') as f:
+                    json.dump(self.memory_cache, f, indent=2)
+                logger.info(f"💾 Backup salvo: {len(self.memory_cache)} licenças")
             return True
         except Exception as e:
             logger.error(f"❌ Erro ao salvar backup: {e}")
@@ -112,6 +121,11 @@ class DBBackup:
     def verify_db_integrity(self):
         """Verifica integridade do BD e restaura se necessário"""
         try:
+            # Se está usando PostgreSQL, não precisa validar SQLite
+            if 'DATABASE_URL' in os.environ:
+                logger.info("🐘 PostgreSQL ativo, backup em segundo plano")
+                return True
+            
             if not os.path.exists(self.db_file):
                 logger.warning("⚠️ BD não encontrado, restaurando do backup...")
                 return self.restore_from_backup()
