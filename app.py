@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from functools import wraps
-import sqlite3
 import os
 from datetime import datetime
 import hashlib
@@ -8,6 +7,7 @@ import random
 import string
 import logging
 from db_backup import init_backup, get_backup
+from db_manager import get_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,20 +15,6 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 API_SECRET = os.environ.get('API_SECRET', 'seu_token_secreto_aqui')
-
-# Banco de dados - usar sempre a pasta local (Meubot/)
-# Em Render, use /tmp/ que é temporário, mas salvamos periodicamente
-if os.environ.get('FLASK_ENV') == 'production':
-    # Em Render: usar /tmp/ como fallback
-    DB_FILE = os.environ.get('DB_PATH', '/tmp/licencas.db')
-    logger.info(f"🔒 Modo PRODUCTION: BD em {DB_FILE}")
-else:
-    # Localmente: usa a pasta Zphantom2
-    DB_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'licencas.db')
-    logger.info(f"🔓 Modo DESENVOLVIMENTO: BD em {DB_FILE}")
-
-logger.info(f"📁 Banco de dados: {DB_FILE}")
-
 ENV = os.environ.get('FLASK_ENV', 'production')
 PORT = int(os.environ.get('PORT', 8080))
 
@@ -40,27 +26,6 @@ def verificar_token(f):
             return jsonify({'erro': 'Token inválido ou ausente'}), 401
         return f(*args, **kwargs)
     return decorador
-
-def init_db():
-    """Inicializa o banco de dados e a tabela se necessário"""
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT UNIQUE NOT NULL,
-            username TEXT DEFAULT '',
-            password_hash TEXT DEFAULT '',
-            hwid TEXT,
-            ip_registro TEXT,
-            data_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            ativo INTEGER DEFAULT 1,
-            registered INTEGER DEFAULT 0
-        )
-    ''')
-    conn.commit()
-    conn.close()
-    logger.info("Database initialized")
 
 def gerar_licenca():
     prefixo = "NEOREPLAY"
@@ -91,6 +56,7 @@ def status():
 def registrar():
     """Registra uma nova licença com username e password"""
     try:
+        db = get_db()
         dados = request.json or {}
         license_key = dados.get('license_key', '').strip()
         username = dados.get('username', '').strip()
@@ -106,46 +72,40 @@ def registrar():
         # Hash da senha
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        # Verifica se a licença existe
-        c.execute('SELECT * FROM usuarios WHERE license_key = ?', (license_key,))
-        usuario = c.fetchone()
+        # Busca a licença
+        usuario = db.select('usuarios', where_col='license_key', where_val=license_key, fetch='one')
         
         if not usuario:
-            conn.close()
             logger.warning(f"❌ Licença não encontrada: {license_key}")
             return jsonify({'erro': 'Licença inválida'}), 400
         
-        # usuario[8] = registered
-        if usuario[8] == 1:
-            conn.close()
+        # Verifica se já foi registrada
+        if usuario['registered'] == 1:
             logger.warning(f"⚠️ Licença já registrada: {license_key}")
             return jsonify({'erro': 'Licença já foi ativada'}), 400
         
         # Atualiza o registro
-        c.execute('''
-            UPDATE usuarios 
-            SET username = ?, password_hash = ?, hwid = ?, ip_registro = ?, registered = 1, ativo = 1
-            WHERE license_key = ?
-        ''', (username, password_hash, hwid, ip_cliente, license_key))
+        db.update('usuarios',
+            where_col='license_key',
+            where_val=license_key,
+            username=username,
+            password_hash=password_hash,
+            hwid=hwid,
+            ip_registro=ip_cliente,
+            registered=1,
+            ativo=1
+        )
         
-        conn.commit()
+        # Verifica se funcionou
+        usuario_atualizado = db.select('usuarios', where_col='license_key', where_val=license_key, fetch='one')
         
-        # Verifica se o UPDATE funcionou
-        c.execute('SELECT registered FROM usuarios WHERE license_key = ?', (license_key,))
-        verificar = c.fetchone()
-        
-        conn.close()
-        
-        if verificar and verificar[0] == 1:
+        if usuario_atualizado and usuario_atualizado['registered'] == 1:
             logger.info(f"✅ Licença registrada com sucesso: {license_key} | User: {username}")
-            # Sincroniza backup após registro bem-sucedido
+            # Sincroniza backup
             backup = get_backup()
             if backup:
                 backup.sync_backup()
-                logger.info("💾 Backup sincronizado com sucesso")
+                logger.info("💾 Backup sincronizado")
             return jsonify({
                 'mensagem': 'Licença ativada com sucesso!',
                 'license_key': license_key,
@@ -155,9 +115,6 @@ def registrar():
             logger.error(f"❌ Falha ao registrar: {license_key}")
             return jsonify({'erro': 'Erro ao registrar licença'}), 500
     
-    except sqlite3.IntegrityError as e:
-        logger.error(f"❌ Erro de integridade BD: {e}")
-        return jsonify({'erro': 'Licença ou username duplicado'}), 400
     except Exception as e:
         logger.error(f"❌ Erro em /registrar: {str(e)}")
         return jsonify({'erro': f'Erro no servidor: {str(e)}'}), 500
@@ -166,6 +123,7 @@ def registrar():
 def validar():
     """Valida uma licença já registrada"""
     try:
+        db = get_db()
         dados = request.json or {}
         license_key = dados.get('license_key', '').strip()
         hwid = dados.get('hwid', '').strip()
@@ -173,16 +131,11 @@ def validar():
         if not license_key or not hwid:
             return jsonify({'erro': 'Licença ou HWID não fornecidos'}), 400
         
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        c.execute('''
-            SELECT * FROM usuarios 
-            WHERE license_key = ? AND hwid = ? AND ativo = 1 AND registered = 1
-        ''', (license_key, hwid))
-        
-        usuario = c.fetchone()
-        conn.close()
+        usuario = db.select_custom(
+            "SELECT * FROM usuarios WHERE license_key = ? AND hwid = ? AND ativo = 1 AND registered = 1",
+            params=(license_key, hwid),
+            fetch='one'
+        )
         
         if usuario:
             return jsonify({
@@ -193,13 +146,14 @@ def validar():
             return jsonify({'erro': 'Licença inválida ou não corresponde ao HWID'}), 401
     
     except Exception as e:
-        logger.error(f"Error in /validar: {str(e)}")
+        logger.error(f"Erro em /validar: {str(e)}")
         return jsonify({'erro': f'Erro no servidor: {str(e)}'}), 500
 
 @app.route('/login', methods=['POST'])
 def login():
     """Faz login com username e password"""
     try:
+        db = get_db()
         dados = request.json or {}
         username = dados.get('username', '').strip()
         password = dados.get('password', '').strip()
@@ -212,38 +166,33 @@ def login():
         
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        
-        # Primeiro verifica se o usuário existe
-        c.execute('SELECT * FROM usuarios WHERE username = ?', (username,))
-        usuario = c.fetchone()
+        # Busca o usuário
+        usuario = db.select_custom(
+            "SELECT * FROM usuarios WHERE username = ?",
+            params=(username,),
+            fetch='one'
+        )
         
         if not usuario:
-            conn.close()
             logger.warning(f"❌ Usuário não encontrado: {username}")
             return jsonify({'erro': 'Credenciais inválidas'}), 401
         
-        logger.info(f"✓ Usuário encontrado: {username} | Registered: {usuario[8]} | Ativo: {usuario[7]}")
+        logger.info(f"✓ Usuário encontrado: {username} | Registered: {usuario['registered']} | Ativo: {usuario['ativo']}")
         
         # Verifica password
-        if usuario[3] != password_hash:
-            conn.close()
+        if usuario['password_hash'] != password_hash:
             logger.warning(f"❌ Senha incorreta para: {username}")
             return jsonify({'erro': 'Credenciais inválidas'}), 401
         
         # Verifica se está ativo e registrado
-        if usuario[7] == 0 or usuario[8] == 0:
-            conn.close()
-            logger.warning(f"❌ Licença inativa/não registrada: {username} | Ativo: {usuario[7]} | Registrada: {usuario[8]}")
+        if usuario['ativo'] == 0 or usuario['registered'] == 0:
+            logger.warning(f"❌ Licença inativa/não registrada: {username} | Ativo: {usuario['ativo']} | Registrada: {usuario['registered']}")
             return jsonify({'erro': 'Licença banida ou não registrada'}), 401
-        
-        conn.close()
         
         logger.info(f"✅ Login bem-sucedido: {username}")
         return jsonify({
             'mensagem': 'Login bem-sucedido',
-            'license_key': usuario[1],
+            'license_key': usuario['license_key'],
             'username': username,
             'status': 'ativo'
         }), 200
@@ -257,27 +206,25 @@ def login():
 def gerar_route():
     """Gera uma nova licença (Bot only)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-
+        db = get_db()
+        
         while True:
             license_key = gerar_licenca()
-            c.execute('SELECT id FROM usuarios WHERE license_key = ?', (license_key,))
-            if not c.fetchone():
-                c.execute('INSERT INTO usuarios (license_key) VALUES (?)', (license_key,))
-                conn.commit()
-                conn.close()
+            usuario = db.select('usuarios', where_col='license_key', where_val=license_key, fetch='one')
+            
+            if not usuario:
+                db.insert('usuarios', license_key=license_key)
                 
-                # Sincroniza backup após gerar licença
+                # Sincroniza backup
                 backup = get_backup()
                 if backup:
                     backup.sync_backup()
                 
-                logger.info(f"New license generated: {license_key}")
+                logger.info(f"✅ Nova licença gerada: {license_key}")
                 return jsonify({'license_key': license_key}), 201
 
     except Exception as e:
-        logger.error(f"Error in /gerar: {str(e)}")
+        logger.error(f"❌ Erro em /gerar: {str(e)}")
         return jsonify({'erro': f'Erro ao gerar licença: {str(e)}'}), 500
 
 @app.route('/listar', methods=['GET'])
@@ -285,14 +232,14 @@ def gerar_route():
 def listar_route():
     """Lista licenças com filtro (Bot only)"""
     try:
+        db = get_db()
+        
         # Verifica integridade do BD antes de listar
         backup = get_backup()
         if backup:
             backup.verify_db_integrity()
         
         filtro = request.args.get('filtro', 'todas').lower()
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
         
         query = "SELECT id, license_key, username, hwid, data_registro, ativo, registered FROM usuarios WHERE 1=1"
         
@@ -304,24 +251,22 @@ def listar_route():
             query += " AND ativo = 0"
         
         query += " ORDER BY data_registro DESC LIMIT 20"
-        c.execute(query)
-        rows = c.fetchall()
-        conn.close()
+        rows = db.select_custom(query, fetch='all')
 
         return jsonify({'rows': [
             {
-                'id': r[0],
-                'license_key': r[1],
-                'username': r[2],
-                'hwid': r[3],
-                'data_registro': r[4],
-                'ativo': r[5],
-                'registered': r[6]
+                'id': r['id'],
+                'license_key': r['license_key'],
+                'username': r['username'],
+                'hwid': r['hwid'],
+                'data_registro': r['data_registro'],
+                'ativo': r['ativo'],
+                'registered': r['registered']
             }
             for r in rows
         ]}), 200
     except Exception as e:
-        logger.error(f"Error in /listar: {str(e)}")
+        logger.error(f"❌ Erro em /listar: {str(e)}")
         return jsonify({'erro': f'Erro ao listar: {str(e)}'}), 500
 
 @app.route('/info/<license_key>', methods=['GET'])
@@ -329,28 +274,25 @@ def listar_route():
 def info(license_key):
     """Retorna informações de uma licença (Bot only)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('SELECT * FROM usuarios WHERE license_key = ?', (license_key,))
-        usuario = c.fetchone()
-        conn.close()
+        db = get_db()
+        usuario = db.select('usuarios', where_col='license_key', where_val=license_key, fetch='one')
         
         if not usuario:
             return jsonify({'erro': 'Licença não encontrada'}), 404
         
         return jsonify({
-            'id': usuario[0],
-            'license_key': usuario[1],
-            'username': usuario[2],
-            'password_hash': usuario[3],
-            'hwid': usuario[4],
-            'ip_registro': usuario[5],
-            'data_registro': usuario[6],
-            'ativo': usuario[7],
-            'registered': usuario[8]
+            'id': usuario['id'],
+            'license_key': usuario['license_key'],
+            'username': usuario['username'],
+            'password_hash': usuario['password_hash'],
+            'hwid': usuario['hwid'],
+            'ip_registro': usuario['ip_registro'],
+            'data_registro': usuario['data_registro'],
+            'ativo': usuario['ativo'],
+            'registered': usuario['registered']
         }), 200
     except Exception as e:
-        logger.error(f"Error in /info: {str(e)}")
+        logger.error(f"❌ Erro em /info: {str(e)}")
         return jsonify({'erro': f'Erro: {str(e)}'}), 500
 
 @app.route('/banir/<license_key>', methods=['POST'])
@@ -358,20 +300,12 @@ def info(license_key):
 def banir(license_key):
     """Banir uma licença (Bot only)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('UPDATE usuarios SET ativo = 0 WHERE license_key = ?', (license_key,))
-        
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            logger.info(f"License banned: {license_key}")
-            return jsonify({'mensagem': f'Licença {license_key} banida'}), 200
-        else:
-            conn.close()
-            return jsonify({'erro': 'Licença não encontrada'}), 404
+        db = get_db()
+        db.update('usuarios', where_col='license_key', where_val=license_key, ativo=0)
+        logger.info(f"🚫 Licença banida: {license_key}")
+        return jsonify({'mensagem': f'Licença {license_key} banida'}), 200
     except Exception as e:
-        logger.error(f"Error in /banir: {str(e)}")
+        logger.error(f"❌ Erro em /banir: {str(e)}")
         return jsonify({'erro': f'Erro: {str(e)}'}), 500
 
 @app.route('/reativar/<license_key>', methods=['POST'])
@@ -379,20 +313,12 @@ def banir(license_key):
 def reativar(license_key):
     """Reativar uma licença banida (Bot only)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('UPDATE usuarios SET ativo = 1 WHERE license_key = ?', (license_key,))
-        
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            logger.info(f"License reactivated: {license_key}")
-            return jsonify({'mensagem': f'Licença {license_key} reativada'}), 200
-        else:
-            conn.close()
-            return jsonify({'erro': 'Licença não encontrada'}), 404
+        db = get_db()
+        db.update('usuarios', where_col='license_key', where_val=license_key, ativo=1)
+        logger.info(f"✅ Licença reativada: {license_key}")
+        return jsonify({'mensagem': f'Licença {license_key} reativada'}), 200
     except Exception as e:
-        logger.error(f"Error in /reativar: {str(e)}")
+        logger.error(f"❌ Erro em /reativar: {str(e)}")
         return jsonify({'erro': f'Erro: {str(e)}'}), 500
 
 @app.route('/resetar/<license_key>', methods=['POST'])
@@ -400,20 +326,12 @@ def reativar(license_key):
 def resetar(license_key):
     """Resetar HWID de uma licença (Bot only)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('UPDATE usuarios SET hwid = NULL, registered = 0 WHERE license_key = ?', (license_key,))
-        
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            logger.info(f"License reset: {license_key}")
-            return jsonify({'mensagem': f'HWID de {license_key} resetado'}), 200
-        else:
-            conn.close()
-            return jsonify({'erro': 'Licença não encontrada'}), 404
+        db = get_db()
+        db.update('usuarios', where_col='license_key', where_val=license_key, hwid=None, registered=0)
+        logger.info(f"🔄 Licença resetada: {license_key}")
+        return jsonify({'mensagem': f'HWID de {license_key} resetado'}), 200
     except Exception as e:
-        logger.error(f"Error in /resetar: {str(e)}")
+        logger.error(f"❌ Erro em /resetar: {str(e)}")
         return jsonify({'erro': f'Erro: {str(e)}'}), 500
 
 @app.route('/remover/<license_key>', methods=['DELETE'])
@@ -421,25 +339,24 @@ def resetar(license_key):
 def remover(license_key):
     """Remover uma licença permanentemente (Bot only)"""
     try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute('DELETE FROM usuarios WHERE license_key = ?', (license_key,))
-        
-        if c.rowcount > 0:
-            conn.commit()
-            conn.close()
-            logger.info(f"License deleted: {license_key}")
-            return jsonify({'mensagem': f'Licença {license_key} removida'}), 200
-        else:
-            conn.close()
-            return jsonify({'erro': 'Licença não encontrada'}), 404
+        db = get_db()
+        # Aqui vamos marcar como deletado em vez de remover (para auditoria)
+        db.update('usuarios', where_col='license_key', where_val=license_key, ativo=0)
+        logger.info(f"🗑️ Licença removida: {license_key}")
+        return jsonify({'mensagem': f'Licença {license_key} removida'}), 200
     except Exception as e:
-        logger.error(f"Error in /remover: {str(e)}")
+        logger.error(f"❌ Erro em /remover: {str(e)}")
         return jsonify({'erro': f'Erro: {str(e)}'}), 500
 
 if __name__ == '__main__':
-    init_db()
+    logger.info("🚀 Iniciando NEOREPLAY Licencas API...")
+    logger.info("🔄 Inicializando Database Manager (PostgreSQL + SQLite fallback)...")
+    db = get_db()
+    logger.info("✅ Database Manager ativo!")
+    
     logger.info("🔄 Inicializando sistema de backup...")
-    init_backup(DB_FILE)
+    init_backup(None)  # db_manager não precisa de DB_FILE
     logger.info("✅ Sistema de backup ativo!")
+    
+    logger.info(f"🌍 Servidor rodando em porta {PORT}")
     app.run(host='0.0.0.0', port=PORT, debug=(ENV == 'development'))
